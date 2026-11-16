@@ -158,6 +158,24 @@ used by ImageIO. Like before, the :func:`function-specific documentation
 <imageio.core.v3_api.imiter>` details the `kwargs` that are always present, and
 additional kwargs are plugin specific and documented by the respective plugin.
 
+Selecting a Video Frame
+^^^^^^^^^^^^^^^^^^^^^^^
+
+The PyAV plugin supports selecting a single video frame either by its position
+in presentation order or by its presentation time in seconds::
+
+    import imageio.v3 as iio
+
+    frame = iio.imread("video.mp4", plugin="pyav", index=120)
+    frame = iio.imread("video.mp4", plugin="pyav", timestamp=4.0)
+
+Frame indices and timestamps are resolved against decoded frames. For variable
+frame-rate videos this avoids the cumulative drift that occurs when converting
+between time and frame numbers using an average frame rate. A timestamp selects
+the frame displayed at that time (the last frame at or before the timestamp),
+and a timestamp past the end returns the final frame. A frame index past the end
+raises ``IndexError``.
+
 Low-Level Access
 ^^^^^^^^^^^^^^^^
 

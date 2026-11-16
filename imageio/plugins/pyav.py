@@ -38,6 +38,24 @@ context:
     PyAVPlugin.container_metadata
     PyAVPlugin.video_stream_metadata
 
+Frame and Time Selection
+------------------------
+
+Frames can be selected by index or by their presentation timestamp. Both
+selections use the decoded frames and their actual timestamps, so they remain
+accurate for variable frame-rate videos::
+
+    import imageio.v3 as iio
+
+    frame = iio.imread("video.mp4", plugin="pyav", index=120)
+    frame = iio.imread("video.mp4", plugin="pyav", timestamp=4.0)
+
+``index`` refers to the frame's position in presentation order. ``timestamp``
+is given in seconds and selects the frame displayed at that time, i.e. the last
+frame whose presentation timestamp is less than or equal to the requested time.
+If the timestamp is after the final frame, the final frame is returned. An
+out-of-range frame index raises ``IndexError``.
+
 Advanced API
 ------------
 
@@ -176,9 +194,10 @@ examples to better understand how to use them.
 """
 
 import gc
+import threading
 from fractions import Fraction
 from math import ceil
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import av
 import av.filter
@@ -329,9 +348,11 @@ class PyAVPlugin(PluginV3):
         self._container = None
         self._video_stream = None
         self._video_filter = None
+        self._lock = threading.RLock()
 
         if request.mode.io_mode == IOMode.read:
             self._next_idx = 0
+            self._pending_frame = None
             try:
                 if request._uri_type == 5:  # 5 is the value of URI_HTTP
                     # pyav should read from HTTP by itself. This enables reading
@@ -381,6 +402,7 @@ class PyAVPlugin(PluginV3):
         self,
         *,
         index: int = ...,
+        timestamp: float = None,
         format: str = "rgb24",
         filter_sequence: List[Tuple[str, Union[str, dict]]] = None,
         filter_graph: Tuple[dict, List] = None,
@@ -391,9 +413,10 @@ class PyAVPlugin(PluginV3):
         """Read frames from the video.
 
         If ``index`` is an integer, this function reads the index-th frame from
-        the file. If ``index`` is ... (Ellipsis), this function reads all frames
-        from the video, stacks them along the first dimension, and returns a
-        batch of frames.
+        the file. If ``timestamp`` is given, this function reads the frame that
+        is displayed at that time. If ``index`` is ... (Ellipsis), this function
+        reads all frames from the video, stacks them along the first dimension,
+        and returns a batch of frames.
 
         Parameters
         ----------
@@ -401,6 +424,12 @@ class PyAVPlugin(PluginV3):
             The index of the frame to read, e.g. ``index=5`` reads the 5th
             frame. If ``...``, read all the frames in the video and stack them
             along a new, prepended, batch dimension.
+        timestamp : float
+            The presentation time in seconds at which to read a frame. The
+            returned frame is the last frame whose presentation timestamp is
+            less than or equal to ``timestamp``. If ``timestamp`` is after the
+            final frame, the final frame is returned. ``timestamp`` and
+            ``index`` are mutually exclusive.
         format : str
             Set the returned colorspace. If not None (default: rgb24), convert
             the data into the given format before returning it. If ``None``
@@ -417,10 +446,9 @@ class PyAVPlugin(PluginV3):
             of edges between nodes of the previous dict. Check the (module-level)
             plugin docs for details and examples.
         constant_framerate : bool
-            If True assume the video's framerate is constant. This allows for
-            faster seeking inside the file. If False, the video is reset before
-            each read and searched from the beginning. If None (default), this
-            value will be read from the container format.
+            Retained for backwards compatibility. Frame selection now always
+            uses the decoded frame order and actual frame timestamps, so this
+            value does not affect accuracy.
         thread_count : int
             How many threads to use when decoding a frame. The default is 0,
             which will set the number using ffmpeg's default, which is based on
@@ -442,91 +470,91 @@ class PyAVPlugin(PluginV3):
 
         Notes
         -----
-        Accessing random frames repeatedly is costly (O(k), where k is the
-        average distance between two keyframes). You should do so only sparingly
-        if possible. In some cases, it can be faster to bulk-read the video (if
-        it fits into memory) and to then access the returned ndarray randomly.
+        Frame indices always refer to decoded frames in presentation order.
+        Seeking by index is exact for both constant and variable frame-rate
+        videos because the decoder counts actual frames instead of estimating
+        from the average frame rate. Reading a frame near the end raises
+        ``IndexError`` instead of returning data beyond the video.
 
-        The current implementation may cause problems for b-frames, i.e.,
-        bidirectionaly predicted pictures. I lack test videos to write unit
-        tests for this case.
+        Timestamp lookup compares the presentation timestamp of each decoded
+        frame. It does not convert timestamps through the average frame rate,
+        so it remains accurate for variable frame-rate videos.
 
         Reading from an index other than ``...``, i.e. reading a single frame,
         currently doesn't support filters that introduce delays.
 
         """
 
-        if index is ...:
-            props = self.properties(format=format)
-            uses_filter = (
-                self._video_filter is not None
-                or filter_graph is not None
-                or filter_sequence is not None
-            )
+        with self._lock:
+            if timestamp is None and index in (..., None):
+                props = self.properties(format=format)
+                uses_filter = (
+                    self._video_filter is not None
+                    or filter_graph is not None
+                    or filter_sequence is not None
+                )
 
-            self._container.seek(0)
-            if not uses_filter and props.shape[0] != 0:
-                frames = np.empty(props.shape, dtype=props.dtype)
-                for idx, frame in enumerate(
-                    self.iter(
-                        format=format,
-                        filter_sequence=filter_sequence,
-                        filter_graph=filter_graph,
-                        thread_count=thread_count,
-                        thread_type=thread_type or "FRAME",
-                    )
-                ):
-                    frames[idx] = frame
-            else:
-                frames = np.stack(
-                    [
-                        x
-                        for x in self.iter(
+                self._reset_decoder()
+                if not uses_filter and props.shape[0] != 0:
+                    frames = np.empty(props.shape, dtype=props.dtype)
+                    for idx, frame in enumerate(
+                        self.iter(
                             format=format,
                             filter_sequence=filter_sequence,
                             filter_graph=filter_graph,
                             thread_count=thread_count,
                             thread_type=thread_type or "FRAME",
                         )
-                    ]
-                )
+                    ):
+                        frames[idx] = frame
+                else:
+                    frames = np.stack(
+                        [
+                            x
+                            for x in self.iter(
+                                format=format,
+                                filter_sequence=filter_sequence,
+                                filter_graph=filter_graph,
+                                thread_count=thread_count,
+                                thread_type=thread_type or "FRAME",
+                            )
+                        ]
+                    )
 
-            # reset stream container, because threading model can't change after
-            # first access
-            self._video_stream = self._container.streams.video[0]
+                # reset stream container, because threading model can't change after
+                # first access
+                self._video_stream = self._container.streams.video[0]
 
-            return frames
+                return frames
 
-        if thread_type is not None and not (
-            self._video_stream.thread_type == thread_type
-            or self._video_stream.thread_type.name == thread_type
-        ):
-            self._video_stream.thread_type = thread_type
+            if timestamp is not None and index not in (..., None):
+                raise ValueError("Pass either `index` or `timestamp`, not both.")
 
-        if (
-            thread_count != 0
-            and thread_count != self._video_stream.codec_context.thread_count
-        ):
-            # in FFMPEG thread_count == 0 means use the default count, which we
-            # change to mean don't change the thread count.
-            self._video_stream.codec_context.thread_count = thread_count
+            if thread_type is not None and not (
+                self._video_stream.thread_type == thread_type
+                or self._video_stream.thread_type.name == thread_type
+            ):
+                self._video_stream.thread_type = thread_type
 
-        if constant_framerate is None:
-            # "variable_fps" is now a flag (handle got removed). Full list at
-            # https://pyav.org/docs/stable/api/container.html#module-av.format
-            variable_fps = bool(self._container.format.flags & 0x400)
-            constant_framerate = not variable_fps
+            if (
+                thread_count != 0
+                and thread_count != self._video_stream.codec_context.thread_count
+            ):
+                # in FFMPEG thread_count == 0 means use the default count, which we
+                # change to mean don't change the thread count.
+                self._video_stream.codec_context.thread_count = thread_count
 
-        # note: cheap for contiguous incremental reads
-        self._seek(index, constant_framerate=constant_framerate)
-        desired_frame = next(self._decoder)
-        self._next_idx += 1
+            if timestamp is not None:
+                desired_frame = self._seek_timestamp(timestamp)
+            else:
+                self._seek(index, constant_framerate=constant_framerate)
+                desired_frame = self._next_frame()
 
-        self.set_video_filter(filter_sequence, filter_graph)
-        if self._video_filter is not None:
-            desired_frame = self._video_filter.send(desired_frame)
+            self.set_video_filter(filter_sequence, filter_graph)
+            if self._video_filter is not None:
+                desired_frame = self._video_filter.send(desired_frame)
 
-        return self._unpack_frame(desired_frame, format=format)
+            return self._unpack_frame(desired_frame, format=format)
 
     def iter(
         self,
@@ -578,28 +606,35 @@ class PyAVPlugin(PluginV3):
 
         """
 
-        self._video_stream.thread_type = thread_type or "SLICE"
-        self._video_stream.codec_context.thread_count = thread_count
+        with self._lock:
+            if self._next_idx is None:
+                self._reset_decoder()
 
-        self.set_video_filter(filter_sequence, filter_graph)
+            self._video_stream.thread_type = thread_type or "SLICE"
+            self._video_stream.codec_context.thread_count = thread_count
 
-        for frame in self._decoder:
-            self._next_idx += 1
+            self.set_video_filter(filter_sequence, filter_graph)
 
-            if self._video_filter is not None:
+            while True:
                 try:
-                    frame = self._video_filter.send(frame)
-                except StopIteration:
+                    frame = self._next_frame()
+                except IndexError:
                     break
 
-            if frame is None:
-                continue
+                if self._video_filter is not None:
+                    try:
+                        frame = self._video_filter.send(frame)
+                    except StopIteration:
+                        break
 
-            yield self._unpack_frame(frame, format=format)
+                if frame is None:
+                    continue
 
-        if self._video_filter is not None:
-            for frame in self._video_filter:
                 yield self._unpack_frame(frame, format=format)
+
+            if self._video_filter is not None:
+                for frame in self._video_filter:
+                    yield self._unpack_frame(frame, format=format)
 
     def write(
         self,
@@ -754,10 +789,9 @@ class PyAVPlugin(PluginV3):
             Currently, this parameter has no effect. It exists for compliance with
             the ImageIO v3 API.
         constant_framerate : bool
-            If True assume the video's framerate is constant. This allows for
-            faster seeking inside the file. If False, the video is reset before
-            each read and searched from the beginning. If None (default), this
-            value will be read from the container format.
+            Retained for backwards compatibility. Frame selection now always
+            uses the decoded frame order, so this value does not affect
+            accuracy.
 
         Returns
         -------
@@ -790,32 +824,28 @@ class PyAVPlugin(PluginV3):
             metadata.update(self.video_stream_metadata)
             return metadata
 
-        if constant_framerate is None:
-            # "variable_fps" is now a flag (handle got removed). Full list at
-            # https://pyav.org/docs/stable/api/container.html#module-av.format
-            variable_fps = bool(self._container.format.flags & 0x400)
-            constant_framerate = not variable_fps
+        with self._lock:
+            self._seek(index, constant_framerate=constant_framerate)
+            desired_frame = self._next_frame()
 
-        self._seek(index, constant_framerate=constant_framerate)
-        desired_frame = next(self._decoder)
-        self._next_idx += 1
+            # useful flags defined on the frame
+            metadata.update(
+                {
+                    "key_frame": bool(desired_frame.key_frame),
+                    "time": desired_frame.time,
+                    "interlaced_frame": bool(desired_frame.interlaced_frame),
+                    "frame_type": _get_frame_type(desired_frame.pict_type),
+                }
+            )
 
-        # useful flags defined on the frame
-        metadata.update(
-            {
-                "key_frame": bool(desired_frame.key_frame),
-                "time": desired_frame.time,
-                "interlaced_frame": bool(desired_frame.interlaced_frame),
-                "frame_type": _get_frame_type(desired_frame.pict_type),
-            }
-        )
+            # side data
+            for item in desired_frame.side_data:
+                if hasattr(item, "type"):
+                    metadata[item.type.name] = bytes(item)
+                else:
+                    metadata[item.name] = bytes(desired_frame.side_data[item])
 
-        # side data
-        metadata.update(
-            {item.type.name: bytes(item) for item in desired_frame.side_data}
-        )
-
-        return metadata
+            return metadata
 
     def close(self) -> None:
         """Close the Video."""
@@ -1179,63 +1209,98 @@ class PyAVPlugin(PluginV3):
 
         return out
 
-    def _seek(self, index, *, constant_framerate: bool = True) -> Generator:
-        """Seeks to the frame at the given index."""
+    def _next_frame(self) -> av.VideoFrame:
+        """Return the next decoded frame in presentation order."""
+
+        if self._pending_frame is not None:
+            frame = self._pending_frame
+            self._pending_frame = None
+            self._next_idx += 1
+            return frame
+
+        try:
+            frame = next(self._decoder)
+        except StopIteration:
+            raise IndexError(
+                f"Frame index {self._next_idx} is out of bounds for a video "
+                f"with {self._next_idx} frames."
+            ) from None
+
+        self._next_idx += 1
+        return frame
+
+    def _reset_decoder(self) -> None:
+        """Restart decoding from the first frame."""
+
+        self._pending_frame = None
+        self._container.seek(0)
+        self._decoder = self._container.decode(video=0)
+        self._next_idx = 0
+
+    def _seek_timestamp(self, timestamp: float) -> av.VideoFrame:
+        """Select the last frame displayed at or before ``timestamp``."""
+
+        if self._next_idx == 0:
+            try:
+                next(self._decoder)
+            except StopIteration:
+                raise IndexError("The video does not contain any frames.") from None
+
+        target_pts = max(0, int(timestamp / self._video_stream.time_base))
+        self._container.seek(target_pts, stream=self._video_stream)
+        self._decoder = self._container.decode(video=0)
+        self._pending_frame = None
+        self._next_idx = None
+        previous_frame = None
+
+        while True:
+            try:
+                frame = next(self._decoder)
+            except StopIteration:
+                if previous_frame is None:
+                    raise IndexError("The video does not contain any frames.") from None
+                return previous_frame
+
+            frame_time = frame.time
+            if frame_time is None:
+                frame_time = float(frame.pts * frame.time_base)
+
+            if frame_time > timestamp:
+                if previous_frame is None:
+                    return frame
+
+                self._pending_frame = frame
+                return previous_frame
+
+            previous_frame = frame
+
+    def _seek(self, index, *, constant_framerate: bool = True) -> None:
+        """Move to the requested frame without estimating from the frame rate."""
+
+        if index < 0:
+            raise IndexError("Frame index must be >= 0.")
+
+        if self._next_idx is None:
+            self._reset_decoder()
 
         if index == self._next_idx:
-            return  # fast path :)
+            return
 
-        # we must decode at least once before we seek otherwise the
-        # returned frames become corrupt.
-        if self._next_idx == 0:
-            next(self._decoder)
-            self._next_idx += 1
+        if index < self._next_idx:
+            self._reset_decoder()
 
-            if index == self._next_idx:
-                return  # fast path :)
-
-        # remove this branch until I find a way to efficiently find the next
-        # keyframe. keeping this as a reminder
-        # if self._next_idx < index and index < self._next_keyframe_idx:
-        #     frames_to_yield = index - self._next_idx
-        if not constant_framerate and index > self._next_idx:
-            frames_to_yield = index - self._next_idx
-        elif not constant_framerate:
-            # seek backwards and can't link idx and pts
-            self._container.seek(0)
-            self._decoder = self._container.decode(video=0)
-            self._next_idx = 0
-
-            frames_to_yield = index
-        else:
-            # we know that the time between consecutive frames is constant
-            # hence we can link index and pts
-
-            # how many pts lie between two frames
-            sec_delta = 1 / self._video_stream.guessed_rate
-            pts_delta = sec_delta / self._video_stream.time_base
-
-            index_pts = int(index * pts_delta)
-
-            # this only seeks to the closest (preceding) keyframe
-            self._container.seek(index_pts, stream=self._video_stream)
-            self._decoder = self._container.decode(video=0)
-
-            # this may be made faster if we could get the keyframe's time without
-            # decoding it
-            keyframe = next(self._decoder)
-            keyframe_time = keyframe.pts * keyframe.time_base
-            keyframe_pts = int(keyframe_time / self._video_stream.time_base)
-            keyframe_index = keyframe_pts // pts_delta
-
-            self._container.seek(index_pts, stream=self._video_stream)
-            self._next_idx = keyframe_index
-
-            frames_to_yield = index - keyframe_index
-
-        for _ in range(frames_to_yield):
-            next(self._decoder)
-            self._next_idx += 1
+        try:
+            while self._next_idx < index:
+                if self._pending_frame is not None:
+                    self._pending_frame = None
+                else:
+                    next(self._decoder)
+                self._next_idx += 1
+        except StopIteration:
+            raise IndexError(
+                f"Frame index {index} is out of bounds for a video "
+                f"with {self._next_idx} frames."
+            ) from None
 
     def _flush_writer(self):
         """Flush the filter and encoder

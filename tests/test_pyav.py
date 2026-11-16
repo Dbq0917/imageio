@@ -2,7 +2,9 @@ import gc
 import io
 import multiprocessing
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +25,49 @@ AV_VERSION = tuple(int(x) for x in av.__version__.split("."))
 # I am disabling test on pypy to stay sane.
 if IS_PYPY:
     pytest.skip("pyAV sometimes causes segfaults on Pypy.", allow_module_level=True)
+
+
+@pytest.fixture
+def vfr_video(tmp_path):
+    path = tmp_path / "vfr.mkv"
+    container = av.open(str(path), "w")
+    stream = container.add_stream("libx264", rate=25)
+    stream.width = 64
+    stream.height = 64
+    stream.pix_fmt = "yuv444p"
+    stream.time_base = Fraction(1, 1000)
+    stream.codec_context.options = {
+        "crf": "0",
+        "g": "5",
+        "keyint_min": "5",
+        "sc_threshold": "0",
+    }
+
+    for index, timestamp in enumerate(
+        [0, 40, 70, 120, 180, 230, 300, 370, 450, 520, 610, 700, 760, 900, 1000, 1300]
+    ):
+        image = np.zeros((64, 64, 3), dtype=np.uint8)
+        image[..., 0] = (index * 37) % 256
+        image[..., 1] = (index * 67) % 256
+        image[..., 2] = (index * 97) % 256
+        frame = av.VideoFrame.from_ndarray(image, format="rgb24")
+        frame.pts = timestamp
+        frame.time_base = stream.time_base
+        for packet in stream.encode(frame):
+            container.mux(packet)
+
+    for packet in stream.encode():
+        container.mux(packet)
+    container.close()
+
+    with av.open(str(path)) as container:
+        timestamps = []
+        markers = []
+        for frame in container.decode(video=0):
+            timestamps.append(frame.time)
+            markers.append(int(frame.to_ndarray(format="rgb24")[0, 0, 0]))
+
+    return path, timestamps, markers
 
 
 def test_mp4_read(test_images: Path):
@@ -478,6 +523,88 @@ def test_seek_vs_iter(test_images):
 
             actual = iio.imread(img_path, plugin="pyav", index=idx)
             assert np.allclose(actual, expected)
+
+
+def test_vfr_frame_indices_are_exact(vfr_video):
+    path, _, markers = vfr_video
+
+    for index, marker in enumerate(markers):
+        actual = iio.imread(path, plugin="pyav", index=index)
+        assert int(actual[0, 0, 0]) == marker
+
+
+def test_ffmpeg_vfr_frame_indices_are_exact(vfr_video):
+    pytest.importorskip("imageio_ffmpeg")
+    path, _, markers = vfr_video
+
+    for index, marker in enumerate(markers):
+        actual = iio.imread(path, plugin="FFMPEG", index=index)
+        assert int(actual[0, 0, 0]) == marker
+
+    with pytest.raises(IndexError):
+        iio.imread(path, plugin="FFMPEG", index=len(markers))
+
+
+def test_vfr_tail_and_out_of_bounds(vfr_video):
+    path, _, markers = vfr_video
+
+    for index in range(len(markers) - 3, len(markers)):
+        actual = iio.imread(path, plugin="pyav", index=index)
+        assert int(actual[0, 0, 0]) == markers[index]
+
+    with pytest.raises(IndexError, match="out of bounds"):
+        iio.imread(path, plugin="pyav", index=len(markers))
+
+
+def test_vfr_timestamp_selection(vfr_video):
+    path, timestamps, markers = vfr_video
+
+    for index, timestamp in enumerate(timestamps):
+        actual = iio.imread(path, plugin="pyav", timestamp=timestamp)
+        expected = iio.imread(path, plugin="pyav", index=index)
+        assert np.array_equal(actual, expected)
+
+    between = (timestamps[5] + timestamps[6]) / 2
+    actual = iio.imread(path, plugin="pyav", timestamp=between)
+    assert int(actual[0, 0, 0]) == markers[5]
+
+    actual = iio.imread(path, plugin="pyav", timestamp=timestamps[-1] + 1)
+    assert int(actual[0, 0, 0]) == markers[-1]
+
+    with pytest.raises(ValueError, match="either `index` or `timestamp`"):
+        iio.imread(path, plugin="pyav", index=3, timestamp=timestamps[3])
+
+
+def test_vfr_frame_and_timestamp_metadata_agree(vfr_video):
+    path, timestamps, _ = vfr_video
+
+    for index in [0, 5, 6, 10, len(timestamps) - 1]:
+        metadata = iio.immeta(path, plugin="pyav", index=index)
+        actual = iio.imread(path, plugin="pyav", timestamp=metadata["time"])
+        expected = iio.imread(path, plugin="pyav", index=index)
+        assert np.array_equal(actual, expected)
+
+
+def test_vfr_random_reads_share_no_decoder_state(vfr_video):
+    path, _, markers = vfr_video
+
+    with iio.imopen(path, "r", plugin="pyav") as file:
+        for index in [15, 0, 7, 6, 12, 3, 15, 0]:
+            actual = file.read(index=index)
+            assert int(actual[0, 0, 0]) == markers[index]
+
+
+def test_vfr_concurrent_reads(vfr_video):
+    path, _, markers = vfr_video
+    indices = [15, 0, 7, 6, 12, 3, 15, 0, 10, 5]
+
+    def read_marker(index):
+        return int(iio.imread(path, plugin="pyav", index=index)[0, 0, 0])
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        actual = list(executor.map(read_marker, indices))
+
+    assert actual == [markers[index] for index in indices]
 
 
 def test_procedual_writing(test_images):

@@ -131,6 +131,11 @@ note that this operation can take a few seconds on large files). Alternatively,
 the number of frames can be estimated from the fps and duration in the meta data
 (though these values themselves are not always present/reliable).
 
+Frame indices refer to the frames produced by the decoder in presentation order.
+Random access is implemented by counting decoded frames rather than converting
+an index through the average frame rate, so it is exact for variable-frame-rate
+videos. Requesting an index beyond the final frame raises ``IndexError``.
+
 """
 
 import re
@@ -410,11 +415,15 @@ class FfmpegFormat(Format):
             elif index >= self._nframes:
                 raise IndexError("Reached end of video")
             else:
-                if (index < self._pos) or (index > self._pos + 100):
-                    self._initialize(index)
-                else:
-                    self._skip_frames(index - self._pos - 1)
-                result, is_new = self._read_frame()
+                try:
+                    if (index < self._pos) or (index > self._pos + 100):
+                        self._initialize()
+                        self._skip_frames(index)
+                    else:
+                        self._skip_frames(index - self._pos - 1)
+                    result, is_new = self._read_frame()
+                except StopIteration:
+                    raise IndexError("Reached end of video") from None
                 self._pos = index
                 return result, dict(new=is_new)
 
@@ -437,32 +446,17 @@ class FfmpegFormat(Format):
                     iargs += ["-pix_fmt", self._arg_pixelformat]
                 if self._arg_size:
                     iargs += ["-s", self._arg_size]
-            elif index > 0:  # re-initialize  / seek
-                # Note: only works if we initialized earlier, and now have meta
-                # Some info here: https://trac.ffmpeg.org/wiki/Seeking
-                # There are two ways to seek, one before -i (input_params) and
-                # after (output_params). The former is fast, because it uses
-                # keyframes, the latter is slow but accurate. According to
-                # the article above, the fast method should also be accurate
-                # from ffmpeg version 2.1, however in version 4.1 our tests
-                # start failing again. Not sure why, but we can solve this
-                # by combining slow and fast. Seek the long stretch using
-                # the fast method, and seek the last 10s the slow way.
-                starttime = index / self._meta["fps"]
-                seek_slow = min(10, starttime)
-                seek_fast = starttime - seek_slow
-                # We used to have this epsilon earlier, when we did not use
-                # the slow seek. I don't think we need it anymore.
-                # epsilon = -1 / self._meta["fps"] * 0.1
-                iargs += ["-ss", "%.06f" % (seek_fast)]
-                oargs += ["-ss", "%.06f" % (seek_slow)]
-
             # Output args, for writing to pipe
             if self._arg_size:
                 oargs += ["-s", self._arg_size]
             if self.request.kwargs.get("fps", None):
                 fps = float(self.request.kwargs["fps"])
                 oargs += ["-r", "%.02f" % fps]
+            else:
+                # Keep the source's native frame timestamps. FFmpeg's default
+                # output mode can duplicate or drop frames in variable-fps
+                # videos, which makes frame indices ambiguous.
+                oargs += ["-fps_mode", "passthrough"]
             oargs += self._arg_output_params
 
             # Get pixelformat and bytes per pixel
@@ -496,10 +490,9 @@ class FfmpegFormat(Format):
                     )
                 else:
                     self._meta.update(meta)
-            elif index == 0:
-                self._meta.update(self._read_gen.__next__())
             else:
-                self._read_gen.__next__()  # we already have meta data
+                self._meta.update(self._read_gen.__next__())
+                self._pos = -1
 
         def _skip_frames(self, n=1):
             """Reads and throws away n frames"""
